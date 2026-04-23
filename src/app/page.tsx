@@ -1,101 +1,340 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useState, useEffect, useCallback } from "react";
+import { useAccount, useBalance, useReadContract } from "wagmi";
+import { formatEther } from "viem";
+import { monadTestnet } from "@/lib/wagmi";
+import { SQUADHUB_ABI, SQUADHUB_ADDRESS, STREAMGRANT_ABI, STREAMGRANT_ADDRESS } from "@/lib/contracts";
+
+import { Header, type TabId } from "@/components/Header";
+import { WalletCard } from "@/components/WalletCard";
+import { ReputationCard } from "@/components/ReputationCard";
+import { StreamCard } from "@/components/StreamCard";
+import { TxLog } from "@/components/TxLog";
+import { RegisterSquadModal } from "@/components/RegisterSquadModal";
+import { SquadSelector } from "@/components/SquadSelector";
+import { RoleSelector, UserContextData } from "@/components/RoleSelector";
+import { DeveloperTab } from "@/components/tabs/DeveloperTab";
+import { CommunityTab } from "@/components/tabs/CommunityTab";
+import { FoundationTab } from "@/components/tabs/FoundationTab";
+import { HackathonTab } from "@/components/tabs/HackathonTab";
+
+const ORACLE_API = process.env.NEXT_PUBLIC_ORACLE_API_URL || "http://localhost:8000";
+
+export interface OracleScore {
+  squad_id: number;
+  score: number;
+  technical_score: number;
+  social_score: number;
+  breakdown: {
+    commits: number;
+    merged_prs: number;
+    closed_issues: number;
+    casts: number;
+    reactions: number;
+    engagement: number;
+  };
+  tx_hash: string | null;
+  on_chain: boolean;
+}
+
+export interface TxLogEntry {
+  squad_id: number;
+  old_score: number;
+  new_score: number;
+  new_effective_rate: string;
+  oracle: string;
+  timestamp: number;
+  tx_hash: string;
+}
+
+export default function Dashboard() {
+  const { address, isConnected, chain } = useAccount();
+  const [activeSquadId, setActiveSquadId] = useState<number>(1);
+  const [oracleScore, setOracleScore] = useState<OracleScore | null>(null);
+  const [oracleLoading, setOracleLoading] = useState(false);
+  const [txLog, setTxLog] = useState<TxLogEntry[]>([]);
+  const [showRegisterModal, setShowRegisterModal] = useState(false);
+  const [isWrongNetwork, setIsWrongNetwork] = useState(false);
+  const [userContext, setUserContext] = useState<UserContextData | null>(null);
+  const [activeTab, setActiveTab] = useState<TabId>("dashboard");
+
+  // Check network
+  useEffect(() => {
+    if (isConnected && chain) {
+      setIsWrongNetwork(chain.id !== monadTestnet.id);
+    }
+  }, [chain, isConnected]);
+
+  // ── Wallet balance ──────────────────────────────────────────────────────────
+  const { data: balanceData } = useBalance({
+    address,
+    chainId: monadTestnet.id,
+  });
+
+  // ── Squad info from SquadHub ────────────────────────────────────────────────
+  const { data: squadData, refetch: refetchSquad } = useReadContract({
+    address: SQUADHUB_ADDRESS,
+    abi: SQUADHUB_ABI,
+    functionName: "getSquad",
+    args: [BigInt(activeSquadId)],
+    chainId: monadTestnet.id,
+    query: { enabled: !!SQUADHUB_ADDRESS && activeSquadId > 0 },
+  });
+
+  const { data: totalSquads } = useReadContract({
+    address: SQUADHUB_ADDRESS,
+    abi: SQUADHUB_ABI,
+    functionName: "totalSquads",
+    chainId: monadTestnet.id,
+    query: { enabled: !!SQUADHUB_ADDRESS },
+  });
+
+  // ── Stream data from StreamGrant ────────────────────────────────────────────
+  const { data: streamData, refetch: refetchStream } = useReadContract({
+    address: STREAMGRANT_ADDRESS,
+    abi: STREAMGRANT_ABI,
+    functionName: "getStream",
+    args: [BigInt(activeSquadId)],
+    chainId: monadTestnet.id,
+    query: { enabled: !!STREAMGRANT_ADDRESS && activeSquadId > 0 },
+  });
+
+  const { data: accruedData, refetch: refetchAccrued } = useReadContract({
+    address: STREAMGRANT_ADDRESS,
+    abi: STREAMGRANT_ABI,
+    functionName: "getAccrued",
+    args: [BigInt(activeSquadId)],
+    chainId: monadTestnet.id,
+    query: { enabled: !!STREAMGRANT_ADDRESS && activeSquadId > 0 },
+  });
+
+  const { data: poolBalance, refetch: refetchPool } = useReadContract({
+    address: STREAMGRANT_ADDRESS,
+    abi: STREAMGRANT_ABI,
+    functionName: "poolBalance",
+    chainId: monadTestnet.id,
+    query: { enabled: !!STREAMGRANT_ADDRESS },
+  });
+
+  const { data: scoreLogLength } = useReadContract({
+    address: STREAMGRANT_ADDRESS,
+    abi: STREAMGRANT_ABI,
+    functionName: "scoreLogLength",
+    chainId: monadTestnet.id,
+    query: { enabled: !!STREAMGRANT_ADDRESS },
+  });
+
+  const { data: scoreLogData, refetch: refetchLog } = useReadContract({
+    address: STREAMGRANT_ADDRESS,
+    abi: STREAMGRANT_ABI,
+    functionName: "getScoreLog",
+    args: [0n, 20n],
+    chainId: monadTestnet.id,
+    query: { enabled: !!STREAMGRANT_ADDRESS && (scoreLogLength ?? 0n) > 0n },
+  });
+
+  // ── Oracle API fetch ────────────────────────────────────────────────────────
+  const fetchOracleScore = useCallback(async () => {
+    setOracleLoading(true);
+    try {
+      const res = await fetch(`${ORACLE_API}/score/${activeSquadId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setOracleScore(data);
+      }
+    } catch {
+      // Oracle not running — graceful degradation
+    } finally {
+      setOracleLoading(false);
+    }
+  }, [activeSquadId]);
+
+  const fetchTxLog = useCallback(async () => {
+    try {
+      const res = await fetch(`${ORACLE_API}/txlog?limit=20`);
+      if (res.ok) {
+        const data = await res.json();
+        setTxLog(data.log || []);
+      }
+    } catch {
+      // Graceful degradation — use on-chain log instead
+    }
+  }, []);
+
+  // ── Polling ─────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    fetchOracleScore();
+    fetchTxLog();
+  }, [fetchOracleScore, fetchTxLog]);
+
+  // Refetch accrued every 5 seconds for live tick
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refetchAccrued();
+      refetchPool();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [refetchAccrued, refetchPool]);
+
+  // Refetch score log every 30 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refetchLog();
+      fetchTxLog();
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [refetchLog, fetchTxLog]);
+
+  // ── Derive display values ────────────────────────────────────────────────────
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const squad = squadData as Record<string, unknown>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const stream = streamData as Record<string, unknown>;
+
+  const reputationScore =
+    (stream?.reputationScore as bigint | undefined) !== undefined
+      ? Number(stream.reputationScore as bigint)
+      : oracleScore?.score ?? null;
+
+  const effectiveFlowRate = (stream?.effectiveFlowRate as bigint | undefined)
+    ? Number(formatEther(stream.effectiveFlowRate as bigint)) * 86400
+    : 0;
+
+  // Map on-chain log
+  const onChainLog: TxLogEntry[] = (scoreLogData as Record<string, unknown>[] | undefined)?.map((e) => ({
+    squad_id: Number(e.squadId as bigint),
+    old_score: Number(e.oldScore as bigint),
+    new_score: Number(e.newScore as bigint),
+    new_effective_rate: formatEther(e.newEffectiveRate as bigint),
+    oracle: e.oracle as string,
+    timestamp: Number(e.timestamp as bigint),
+    tx_hash: "0x" + Buffer.from((e.txHash as string).slice(2), "hex").toString("hex"),
+  })) ?? [];
+
+  const displayLog = txLog.length > 0 ? txLog : onChainLog;
+
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="https://nextjs.org/icons/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
+    <div className="relative min-h-screen z-10">
+      <div className="relative z-10 max-w-[1400px] mx-auto px-6 pb-20">
+        {/* Header */}
+        <Header
+          isConnected={isConnected}
+          isWrongNetwork={isWrongNetwork}
+          userContext={userContext}
+          onRegister={() => setShowRegisterModal(true)}
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
         />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+        {/* Wrong Network Warning */}
+        {isConnected && isWrongNetwork && (
+          <div
+            className="fade-in mb-6 px-5 py-4 rounded-xl"
+            style={{
+              background: "rgba(239, 68, 68, 0.08)",
+              border: "1px solid rgba(239, 68, 68, 0.25)",
+            }}
           >
-            <Image
-              className="dark:invert"
-              src="https://nextjs.org/icons/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
+            <div className="flex items-center gap-3">
+              <span style={{ fontSize: "20px" }}>⚠️</span>
+              <div>
+                <p style={{ color: "#f87171", fontWeight: 600, fontSize: "14px" }}>
+                  Wrong Network
+                </p>
+                <p style={{ color: "#9090b0", fontSize: "13px" }}>
+                  Please switch to <strong style={{ color: "#f0f0ff" }}>Monad Testnet</strong> (Chain ID: 10143) in your wallet.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Role Selector */}
+        {address && !userContext && (
+          <RoleSelector onSelect={setUserContext} />
+        )}
+
+        {/* Tab Content */}
+        {activeTab === "dashboard" && (
+          <>
+            <SquadSelector
+              activeSquadId={activeSquadId}
+              totalSquads={Number(totalSquads ?? 0)}
+              onSelect={setActiveSquadId}
             />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
-        </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(12, 1fr)",
+                gap: "20px",
+                alignItems: "start",
+              }}
+            >
+              <div style={{ gridColumn: "1 / 5" }}>
+                <WalletCard
+                  address={address}
+                  balance={balanceData ? Number(formatEther(balanceData.value)).toFixed(4) : "—"}
+                  isConnected={isConnected}
+                  squad={squad}
+                  squadId={activeSquadId}
+                />
+              </div>
+              <div style={{ gridColumn: "5 / 9" }}>
+                <ReputationCard
+                  score={reputationScore}
+                  oracleScore={oracleScore}
+                  loading={oracleLoading}
+                  onRefresh={fetchOracleScore}
+                />
+              </div>
+              <div style={{ gridColumn: "9 / 13" }}>
+                <StreamCard
+                  squadId={activeSquadId}
+                  stream={stream}
+                  accrued={accruedData as bigint | undefined}
+                  poolBalance={poolBalance as bigint | undefined}
+                  effectiveFlowRatePerDay={effectiveFlowRate}
+                  onClaim={refetchStream}
+                />
+              </div>
+              <div style={{ gridColumn: "1 / 13" }}>
+                <TxLog
+                  entries={displayLog}
+                  onRefresh={() => { refetchLog(); fetchTxLog(); }}
+                />
+              </div>
+            </div>
+          </>
+        )}
+
+        {activeTab === "developer" && <DeveloperTab />}
+        {activeTab === "community" && <CommunityTab />}
+        {activeTab === "foundation" && (
+          <FoundationTab
+            foundationName={userContext?.name}
+            foundationImage={userContext?.image}
           />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
+        )}
+        {activeTab === "hackathon" && (
+          <HackathonTab
+            userRole={userContext?.role || "developer"}
+            foundationName={userContext?.name}
           />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
+        )}
+
+        {/* Register Squad Modal */}
+        {showRegisterModal && (
+          <RegisterSquadModal
+            onClose={() => setShowRegisterModal(false)}
+            onSuccess={(squadId) => {
+              setActiveSquadId(squadId);
+              setShowRegisterModal(false);
+              refetchSquad();
+            }}
           />
-          Go to nextjs.org →
-        </a>
-      </footer>
+        )}
+      </div>
     </div>
   );
 }

@@ -20,6 +20,7 @@ import { FoundationTab } from "@/components/tabs/FoundationTab";
 import { HackathonTab } from "@/components/tabs/HackathonTab";
 
 const ORACLE_API = process.env.NEXT_PUBLIC_ORACLE_API_URL || "http://localhost:8000";
+const USER_CONTEXT_KEY_PREFIX = "collabos_user_context_";
 
 export interface OracleScore {
   squad_id: number;
@@ -59,12 +60,43 @@ export default function Dashboard() {
   const [userContext, setUserContext] = useState<UserContextData | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>("dashboard");
 
+  const handleUserContextSelect = useCallback((data: UserContextData) => {
+    setUserContext(data);
+    if (typeof window !== "undefined" && address) {
+      localStorage.setItem(`${USER_CONTEXT_KEY_PREFIX}${address.toLowerCase()}`, JSON.stringify(data));
+    }
+  }, [address]);
+
   // Check network
   useEffect(() => {
     if (isConnected && chain) {
       setIsWrongNetwork(chain.id !== monadTestnet.id);
     }
   }, [chain, isConnected]);
+
+  // Restore persisted role context per wallet
+  useEffect(() => {
+    if (!address || typeof window === "undefined") {
+      setUserContext(null);
+      return;
+    }
+
+    try {
+      const raw = localStorage.getItem(`${USER_CONTEXT_KEY_PREFIX}${address.toLowerCase()}`);
+      if (!raw) {
+        setUserContext(null);
+        return;
+      }
+      const parsed = JSON.parse(raw) as UserContextData;
+      if (parsed?.role) {
+        setUserContext(parsed);
+      } else {
+        setUserContext(null);
+      }
+    } catch {
+      setUserContext(null);
+    }
+  }, [address]);
 
   // ── Wallet balance ──────────────────────────────────────────────────────────
   const { data: balanceData } = useBalance({
@@ -252,7 +284,7 @@ export default function Dashboard() {
 
         {/* Role Selector */}
         {address && !userContext && (
-          <RoleSelector onSelect={setUserContext} />
+          <RoleSelector onSelect={handleUserContextSelect} />
         )}
 
         {/* Tab Content */}

@@ -64,12 +64,6 @@ function makeId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function hashFromText(text: string): number {
-  let hash = 0;
-  for (let i = 0; i < text.length; i++) hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
-  return hash;
-}
-
 function calcDeveloperScore(profile: DeveloperProfile): number {
   const g = profile.githubData;
   const f = profile.farcasterData;
@@ -96,11 +90,77 @@ function calcFoundationScore(profile: FoundationProfile): number {
   return Math.min(100, Math.round(grantScore + monScore + investScore));
 }
 
-async function withFallback<T>(backendCall: () => Promise<T>, mockCall: () => T): Promise<T> {
+async function withFallback<T>(backendCall: () => Promise<T>, mockCall: () => T | Promise<T>): Promise<T> {
   try {
     return await backendCall();
   } catch {
-    return mockCall();
+    return await mockCall();
+  }
+}
+
+async function fetchGitHubLive(username: string): Promise<{
+  repos: number;
+  commits: number;
+  mergedPrs: number;
+  closedIssues: number;
+  stars: number;
+  avatarUrl: string;
+  bio: string;
+  name: string;
+}> {
+  const userRes = await fetch(`https://api.github.com/users/${username}`);
+  if (!userRes.ok) {
+    throw new Error("GitHub user not found");
+  }
+  const user = await userRes.json();
+
+  const reposRes = await fetch(`https://api.github.com/users/${username}/repos?per_page=100&sort=updated`);
+  const repos = reposRes.ok ? await reposRes.json() : [];
+
+  const eventsRes = await fetch(`https://api.github.com/users/${username}/events?per_page=100`);
+  const events = eventsRes.ok ? await eventsRes.json() : [];
+
+  const totalStars = Array.isArray(repos)
+    ? repos.reduce((acc: number, r: { stargazers_count?: number }) => acc + (r.stargazers_count || 0), 0)
+    : 0;
+
+  let commits = 0;
+  let mergedPrs = 0;
+  let closedIssues = 0;
+
+  if (Array.isArray(events)) {
+    for (const e of events) {
+      if (e?.type === "PushEvent") commits += e?.payload?.commits?.length || 0;
+      if (e?.type === "PullRequestEvent" && e?.payload?.action === "closed" && e?.payload?.pull_request?.merged) mergedPrs += 1;
+      if (e?.type === "IssuesEvent" && e?.payload?.action === "closed") closedIssues += 1;
+    }
+  }
+
+  return {
+    repos: user.public_repos || 0,
+    commits,
+    mergedPrs,
+    closedIssues,
+    stars: totalStars,
+    avatarUrl: user.avatar_url || `https://github.com/${username}.png`,
+    bio: user.bio || "",
+    name: user.name || username,
+  };
+}
+
+async function fetchFarcasterLive(fid: string): Promise<{ casts: number; reactions: number; followers: number }> {
+  try {
+    const castsRes = await fetch(`https://hub.pinata.cloud/v1/castsByFid?fid=${fid}&pageSize=100`);
+    const castsData = castsRes.ok ? await castsRes.json() : {};
+    const casts = Array.isArray(castsData?.messages) ? castsData.messages.length : 0;
+
+    const reactionsRes = await fetch(`https://hub.pinata.cloud/v1/reactionsByFid?fid=${fid}&reaction_type=1&pageSize=100`);
+    const reactionsData = reactionsRes.ok ? await reactionsRes.json() : {};
+    const reactions = Array.isArray(reactionsData?.messages) ? reactionsData.messages.length : 0;
+
+    return { casts, reactions, followers: 0 };
+  } catch {
+    return { casts: 0, reactions: 0, followers: 0 };
   }
 }
 
@@ -223,31 +283,28 @@ export const platformApi = {
   }) =>
     withFallback(
       () => request<DeveloperProfile>("/platform/developers/register", { method: "POST", body: JSON.stringify(payload) }),
-      () => {
+      async () => {
         const all = readMock<DeveloperProfile>(MOCK_KEYS.developers);
-        const seed = hashFromText(payload.githubUsername + payload.farcasterFid + payload.address);
+
+        const gh = await fetchGitHubLive(payload.githubUsername);
+        const fc = payload.farcasterFid ? await fetchFarcasterLive(payload.farcasterFid) : null;
+
         const profile: DeveloperProfile = {
           address: payload.address,
           githubUsername: payload.githubUsername,
           farcasterFid: payload.farcasterFid,
           githubData: {
-            repos: 3 + (seed % 20),
-            commits: 10 + (seed % 50),
-            mergedPrs: 2 + (seed % 12),
-            closedIssues: 1 + (seed % 10),
-            stars: 20 + (seed % 300),
+            repos: gh.repos,
+            commits: gh.commits,
+            mergedPrs: gh.mergedPrs,
+            closedIssues: gh.closedIssues,
+            stars: gh.stars,
           },
-          farcasterData: payload.farcasterFid
-            ? {
-                casts: 5 + (seed % 30),
-                reactions: 10 + (seed % 120),
-                followers: seed % 500,
-              }
-            : null,
+          farcasterData: fc,
           githubMeta: {
-            avatarUrl: `https://github.com/${payload.githubUsername}.png`,
-            bio: "Mock profile for local demo",
-            name: payload.githubUsername,
+            avatarUrl: gh.avatarUrl,
+            bio: gh.bio,
+            name: gh.name,
           },
           score: 0,
           registeredAt: nowMs(),
